@@ -1,0 +1,39 @@
+name: Copy Release Notes to Sub-issue
+
+on:
+  # GitHub documents `sub_issues` as a webhook payload category, but it is not
+  # listed in the Actions "events that trigger workflows" reference. In this
+  # repository, attaching an existing issue as a sub-issue produced the
+  # `parent_issue_added` timeline event but no Actions run, so use only
+  # supported Actions triggers here. Issues attached as sub-issues after
+  # creation are handled during pull request validation: PVS_Issue_Validate.yaml
+  # checks whether each issue linked to the PR has a parent and, if so, copies
+  # the root release notes immediately. workflow_dispatch remains as a manual
+  # fallback for a single issue.
+  issues:
+    types:
+      - opened
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to reconcile immediately"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  copy-release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Copy root release notes to sub-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { run } = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/copyReleaseNotesToSubissue.js`);
+            await run({ github, context, core });

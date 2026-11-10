@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v10.0/.Modules/settings.schema.json",
+  "country": "w1",
+  "appFolders": [],
+  "testFolders": [],
+  "bcptTestFolders": [],
+  "appDependencyProbingPaths": [
+    {
+      "repo": "https://github.com/printvis/PrintVis",
+      "release_status": "release",
+      "version": "latest",
+      "projects": "*",
+      "AuthTokenSecret": "LibraryAppRepoToken"
+    }
+  ],
+  "keyVaultCodeSignCertificateName": "Code-Sign-Cert-2024",
+  "doNotSignApps": false,
+  "enableCodeCop": true,
+  "enableUICop": true
+}

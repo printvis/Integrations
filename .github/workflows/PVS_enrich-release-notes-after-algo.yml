@@ -1,0 +1,250 @@
+name: Enrich Release Notes After AL-Go
+
+on:
+  workflow_run:
+    workflows:
+      - "Create Release"
+      - "AL-Go - Create Release"
+      - " Create release"
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: read
+  actions: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check AL-Go run result
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            if (run.conclusion === 'success') {
+              core.setOutput('proceed', 'true');
+              return;
+            }
+            if (run.conclusion !== 'failure') {
+              core.info(`Run concluded '${run.conclusion}'. Skipping.`);
+              core.setOutput('proceed', 'false');
+              return;
+            }
+
+            // Proceed if the only failed job is the AL-Go system files update check
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100
+            });
+            const failedJobs = jobs.filter(j => j.conclusion === 'failure');
+            const onlyUpdateCheck = failedJobs.length > 0 && failedJobs.every(j => {
+              const failedSteps = (j.steps || []).filter(s => s.conclusion === 'failure');
+              return j.name === 'CheckForUpdates' && failedSteps.length > 0 &&
+                failedSteps.every(s => s.name === 'Check for updates to AL-Go system files');
+            });
+            const createReleaseOk = jobs.some(j => j.name === 'CreateRelease' && j.conclusion === 'success');
+
+            core.info(`Failed jobs: ${failedJobs.map(j => j.name).join(', ') || 'none'}`);
+            core.setOutput('proceed', String(onlyUpdateCheck && createReleaseOk));
+
+  enrich:
+    needs: gate
+    if: ${{ needs.gate.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enrich latest release notes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Small delay can help if AL-Go just created/updated the release.
+            await new Promise(r => setTimeout(r, 15000));
+
+            // Find latest published, non-draft release
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner, repo, per_page: 100
+            });
+
+            const publishedSorted = releases
+              .filter(r => !r.draft && !r.prerelease)
+              .sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
+
+            const current = publishedSorted[0];
+            const previous = publishedSorted[1];
+
+            if (!current) {
+              core.info("No published release found. Skipping.");
+              return;
+            }
+
+            if (!previous) {
+              core.info("No previous published release found. Skipping enrichment.");
+              return;
+            }
+
+            let body = current.body || "";
+
+            // Idempotency guard
+            if (body.includes("## Notes from linked issues")) {
+              core.info("Release body already enriched. Skipping update.");
+              return;
+            }
+
+            const base = previous.tag_name;
+            const head = current.tag_name;
+
+            core.info(`Comparing ${base}...${head}`);
+            const compare = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${head}`
+            });
+
+            const prNumbers = new Set();
+
+            for (const c of compare.data.commits) {
+              const msg = c.commit.message || "";
+
+              for (const m of msg.matchAll(/\(#(\d+)\)/g)) {
+                prNumbers.add(Number(m[1]));
+              }
+
+              const mm = msg.match(/Merge pull request #(\d+)/i);
+              if (mm) prNumbers.add(Number(mm[1]));
+            }
+
+            if (prNumbers.size === 0) {
+              core.info("No PRs detected from compare range.");
+              return;
+            }
+
+            // Use GitHub's actual closing-issue links (Development sidebar / closing keywords
+            // recognised by GitHub) instead of regex-matching text in the PR body.
+            const issueNumbers = new Set();
+
+            for (const prNumber of prNumbers) {
+              try {
+                const res = await github.graphql(`
+                  query($owner:String!, $repo:String!, $num:Int!) {
+                    repository(owner:$owner, name:$repo) {
+                      pullRequest(number:$num) {
+                        merged
+                        closingIssuesReferences(first: 50) {
+                          nodes { number repository { nameWithOwner } }
+                        }
+                      }
+                    }
+                  }`, { owner, repo, num: prNumber });
+
+                const pr = res.repository.pullRequest;
+                if (!pr || !pr.merged) continue;
+
+                for (const n of pr.closingIssuesReferences.nodes) {
+                  if (n.repository.nameWithOwner.toLowerCase() === `${owner}/${repo}`.toLowerCase()) {
+                    issueNumbers.add(n.number);
+                  }
+                }
+              } catch (e) {
+                core.warning(`Failed to fetch PR #${prNumber}: ${e.message}`);
+              }
+            }
+
+            if (issueNumbers.size === 0) {
+              core.info("No linked issues found for PRs in this release.");
+              return;
+            }
+
+            function extractSection(md, heading = "release notes") {
+              const lines = (md || "").split(/\r?\n/);
+              let start = -1;
+              let level = 2;
+
+              for (let i = 0; i < lines.length; i++) {
+                const m = lines[i].match(/^(#{1,6})\s+(.*)\s*$/);
+                if (!m) continue;
+                const l = m[1].length;
+                const title = m[2].trim().toLowerCase();
+                if (title === heading) {
+                  start = i + 1;
+                  level = l;
+                  break;
+                }
+              }
+
+              if (start === -1) return null;
+
+              let end = lines.length;
+              for (let i = start; i < lines.length; i++) {
+                const m = lines[i].match(/^(#{1,6})\s+/);
+                if (!m) continue;
+                const l = m[1].length;
+                if (l <= level) {
+                  end = i;
+                  break;
+                }
+              }
+
+              const content = lines.slice(start, end).join("\n").trim();
+              return content || null;
+            }
+
+            const collected = [];
+
+            for (const issueNumber of issueNumbers) {
+              try {
+                const issue = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber
+                });
+
+                if (issue.data.pull_request) continue;
+
+                // Only include issues that are actually resolved. If the primary PR
+                // is still open, the issue stays open and must not be released yet.
+                if (issue.data.state !== "closed" || issue.data.state_reason === "not_planned") {
+                  core.info(`Skipping #${issueNumber}: issue is not closed as completed.`);
+                  continue;
+                }
+
+                const section = extractSection(issue.data.body || "", "release notes");
+                if (section) {
+                  collected.push({
+                    issueNumber,
+                    title: issue.data.title,
+                    text: section
+                  });
+                }
+              } catch (e) {
+                core.warning(`Failed to fetch issue #${issueNumber}: ${e.message}`);
+              }
+            }
+
+            if (collected.length === 0) {
+              core.info("No '## Release notes' sections found in linked issues.");
+              return;
+            }
+
+            let appendix = "\n\n---\n## Notes from linked issues\n";
+            for (const item of collected) {
+              appendix += `\n### #${item.issueNumber} - ${item.title}\n${item.text}\n`;
+            }
+
+            body += appendix;
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: current.id,
+              body
+            });
+
+            core.info(`Release ${current.tag_name} updated with linked issue notes.`);

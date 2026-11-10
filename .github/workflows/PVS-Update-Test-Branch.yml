@@ -1,0 +1,696 @@
+name: Sync PRs to test branch
+
+# ⚙️ To only merge PRs with specific labels, set requiredLabels in .github/settings.json
+# To exclude PRs with specific labels, set excludeLabels in .github/settings.json
+on:
+  workflow_run:
+    workflows: ["Pull Request Build"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-prs-to-test-branch
+  cancel-in-progress: false
+
+jobs:
+  rebuild-test-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+      statuses: write
+      issues: read
+    outputs:
+      mergedBranches: ${{ steps.merge.outputs.mergedBranches }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Check trigger eligibility
+        id: trigger
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.workflow_run.conclusion }}" == "success" ] || \
+               [ "${{ github.event.workflow_run.conclusion }}" == "skipped" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "conclusion=${{ github.event.workflow_run.conclusion }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notice — ineligible trigger conclusion
+        if: steps.trigger.outputs.skip == 'true'
+        run: |
+          CONCLUSION="${{ steps.trigger.outputs.conclusion }}"
+          echo "::notice::Sync skipped — triggering workflow concluded with '$CONCLUSION' (expected 'success' or 'skipped'). No changes were made to the test branch."
+          {
+            echo "## ⏭️ Skipped"
+            echo "| | |"
+            echo "|-|-|"
+            echo "| **Reason** | Triggering workflow concluded with \`$CONCLUSION\` |"
+            echo "| **Expected** | \`success\` or \`skipped\` |"
+            echo "| **Test branch** | no changes made |"
+            echo ""
+            echo "> The status check has been marked ✅ green. No action is required."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Read settings
+        id: settings
+        if: steps.trigger.outputs.skip == 'false'
+        run: |
+          SETTINGS_FILE=".github/settings.json"
+          if [ ! -f "$SETTINGS_FILE" ]; then
+            echo "::warning::$SETTINGS_FILE not found — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Read top-level default labels
+          TOP_REQUIRED_LABELS=$(jq -c '
+            if .requiredLabels then
+              if (.requiredLabels | type) == "array" then .requiredLabels
+              else [.requiredLabels]
+              end
+            elif .requiredLabel and .requiredLabel != "" then
+              [.requiredLabel]
+            else []
+            end' "$SETTINGS_FILE")
+          TOP_EXCLUDE_LABELS=$(jq -c '.excludeLabels // []' "$SETTINGS_FILE")
+          # Build testBranches array: use new format, fall back to legacy testBranch/baseBranch
+          TEST_BRANCHES_JSON=$(jq -c \
+            --argjson topRequired "$TOP_REQUIRED_LABELS" \
+            --argjson topExclude "$TOP_EXCLUDE_LABELS" \
+            '
+            if .testBranches and (.testBranches | length) > 0 then
+              [.testBranches[] | {
+                name: .name,
+                baseBranch: .baseBranch,
+                requiredLabels: (.requiredLabels // $topRequired),
+                excludeLabels:  (.excludeLabels  // $topExclude)
+              }]
+            elif .testBranch.name and .baseBranch.name then
+              [{
+                name: .testBranch.name,
+                baseBranch: .baseBranch.name,
+                requiredLabels: $topRequired,
+                excludeLabels:  $topExclude
+              }]
+            else
+              []
+            end' "$SETTINGS_FILE")
+          if [ "$(echo "$TEST_BRANCHES_JSON" | jq 'length')" -eq 0 ]; then
+            echo "::warning::No testBranches configured — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # For backward-compat and prcheck: expose top-level labels as single-branch outputs too
+          REQUIRED_LABELS_DISPLAY=$(echo "$TOP_REQUIRED_LABELS" | jq -r '. | join(", ")')
+          EXCLUDE_LABELS_DISPLAY=$(echo "$TOP_EXCLUDE_LABELS" | jq -r '. | join(", ")')
+          echo "testBranchesJson=$TEST_BRANCHES_JSON" >> $GITHUB_OUTPUT
+          echo "requiredLabelsJson=$TOP_REQUIRED_LABELS" >> $GITHUB_OUTPUT
+          echo "requiredLabelsDisplay=$REQUIRED_LABELS_DISPLAY" >> $GITHUB_OUTPUT
+          echo "excludeLabelsJson=$TOP_EXCLUDE_LABELS" >> $GITHUB_OUTPUT
+          echo "excludeLabelsDisplay=$EXCLUDE_LABELS_DISPLAY" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Collect appFolders from all AL-Go settings sources
+        id: algocheck
+        if: steps.trigger.outputs.skip == 'false' && steps.settings.outputs.skip == 'false'
+        env:
+          ALGoOrgSettings: ${{ vars.ALGoOrgSettings }}
+          ALGoRepoSettings: ${{ vars.ALGoRepoSettings }}
+        run: |
+          ALL_APP_FOLDERS=()
+          collect_app_folders() {
+            local json="$1"
+            if [ -n "$json" ]; then
+              mapfile -t folders < <(echo "$json" | jq -r '.appFolders // [] | .[]' 2>/dev/null)
+              ALL_APP_FOLDERS+=("${folders[@]}")
+            fi
+          }
+          collect_app_folders "$ALGoOrgSettings"
+          [ -f ".github/AL-Go-TemplateRepoSettings.doNotEdit.json" ] && collect_app_folders "$(cat .github/AL-Go-TemplateRepoSettings.doNotEdit.json)"
+          [ -f ".github/AL-Go-Settings.json" ] && collect_app_folders "$(cat .github/AL-Go-Settings.json)"
+          collect_app_folders "$ALGoRepoSettings"
+          [ -f ".github/AL-Go-TemplateProjectSettings.doNotEdit.json" ] && collect_app_folders "$(cat .github/AL-Go-TemplateProjectSettings.doNotEdit.json)"
+          for settings_file in $(find . -path './.git' -prune -o -name 'settings.json' -path '*/.AL-Go/*' -print); do
+            collect_app_folders "$(cat "$settings_file")"
+          done
+          for settings_file in $(find .github -name '*.settings.json' 2>/dev/null); do
+            [ -f "$settings_file" ] && collect_app_folders "$(cat "$settings_file")"
+          done
+          mapfile -t UNIQUE_FOLDERS < <(printf '%s\n' "${ALL_APP_FOLDERS[@]}" | sort -u)
+          if [ ${#UNIQUE_FOLDERS[@]} -eq 0 ]; then
+            echo "::warning::No appFolders found — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            printf '%s\n' "${UNIQUE_FOLDERS[@]}" > /tmp/app_folders.txt
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if triggering PR changed any app code
+        id: prcheck
+        if: steps.trigger.outputs.skip == 'false' && steps.algocheck.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUIRED_LABELS_JSON: ${{ steps.settings.outputs.requiredLabelsJson }}
+          EXCLUDE_LABELS_JSON: ${{ steps.settings.outputs.excludeLabelsJson }}
+        run: |
+          # Match merge step behavior: handle command failures explicitly and skip gracefully when PR data is stale/inaccessible.
+          set +e
+          GH_ERR_FILE=$(mktemp)
+          trap 'rm -f "$GH_ERR_FILE"' EXIT
+          skip_with_gh_warning() {
+            local context="$1"
+            local err_msg=""
+            if [ -s "$GH_ERR_FILE" ]; then
+              err_msg=$(tr '\n' ' ' < "$GH_ERR_FILE" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+            fi
+            if [ -n "$err_msg" ]; then
+              echo "::warning::${context} — skipping sync: ${err_msg}"
+            else
+              echo "::warning::${context} — skipping sync"
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          : > "$GH_ERR_FILE"
+          PR_NUMBER=$(gh api /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }} \
+            --jq '.pull_requests[0].number' 2>"$GH_ERR_FILE")
+          PR_NUMBER_STATUS=$?
+          if [ $PR_NUMBER_STATUS -ne 0 ]; then
+            skip_with_gh_warning "Could not determine PR number for workflow run ${{ github.event.workflow_run.id }}"
+          fi
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
+            echo "::warning::Could not determine PR number — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          : > "$GH_ERR_FILE"
+          IS_DRAFT=$(gh pr view $PR_NUMBER --json isDraft --jq '.isDraft' 2>"$GH_ERR_FILE")
+          IS_DRAFT_STATUS=$?
+          if [ $IS_DRAFT_STATUS -ne 0 ]; then
+            skip_with_gh_warning "Could not read PR #$PR_NUMBER draft status"
+          fi
+          if [ -z "$IS_DRAFT" ] || { [ "$IS_DRAFT" != "true" ] && [ "$IS_DRAFT" != "false" ]; }; then
+            echo "::warning::Could not read PR #$PR_NUMBER (may be closed/inaccessible) — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ "$IS_DRAFT" == "true" ]; then
+            echo "::warning::Triggering PR #$PR_NUMBER is a draft — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          : > "$GH_ERR_FILE"
+          PR_LABELS_RAW=$(gh pr view $PR_NUMBER --json labels,body --jq '{labels: [.labels[].name], body: .body}' 2>"$GH_ERR_FILE")
+          PR_LABELS_RAW_STATUS=$?
+          if [ $PR_LABELS_RAW_STATUS -ne 0 ]; then
+            skip_with_gh_warning "Could not read PR #$PR_NUMBER labels/body"
+          fi
+          if [ -z "$PR_LABELS_RAW" ] || ! echo "$PR_LABELS_RAW" | jq -e . >/dev/null 2>&1; then
+            echo "::warning::Could not read PR #$PR_NUMBER (may be closed/inaccessible) — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          PR_LABELS=$(echo "$PR_LABELS_RAW" | jq -c '.labels' 2>/dev/null)
+          PR_LABELS_STATUS=$?
+          PR_BODY=$(echo "$PR_LABELS_RAW" | jq -r '.body // ""' 2>/dev/null)
+          PR_BODY_STATUS=$?
+          if [ $PR_LABELS_STATUS -ne 0 ] || [ $PR_BODY_STATUS -ne 0 ] || ! echo "$PR_LABELS" | jq -e . >/dev/null 2>&1; then
+            echo "::warning::Could not parse labels/body for PR #$PR_NUMBER — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if ! echo "$REQUIRED_LABELS_JSON" | jq -e . >/dev/null 2>&1; then
+            REQUIRED_LABELS_JSON='[]'
+          fi
+          if ! echo "$EXCLUDE_LABELS_JSON" | jq -e . >/dev/null 2>&1; then
+            EXCLUDE_LABELS_JSON='[]'
+          fi
+          LINKED_ISSUES=$(printf '%s' "$PR_BODY" | grep -oiE '(closes|fixes|resolves)[[:space:]]+#([0-9]+)' | grep -oE '[0-9]+' | sort -u || true)
+          for issue_num in $LINKED_ISSUES; do
+            : > "$GH_ERR_FILE"
+            ISSUE_LABELS=$(gh api /repos/${{ github.repository }}/issues/$issue_num --jq '[.labels[].name]' 2>"$GH_ERR_FILE")
+            ISSUE_LABELS_STATUS=$?
+            if [ $ISSUE_LABELS_STATUS -ne 0 ]; then
+              skip_with_gh_warning "Could not read labels for linked issue #$issue_num"
+            fi
+            if ! echo "$ISSUE_LABELS" | jq -e . >/dev/null 2>&1; then
+              echo "::warning::Could not parse labels for linked issue #$issue_num — skipping sync"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            PR_LABELS=$(jq -n --argjson a "$PR_LABELS" --argjson b "$ISSUE_LABELS" '$a + $b | unique')
+          done
+          if [ "$(echo "$EXCLUDE_LABELS_JSON" | jq 'length')" -gt 0 ]; then
+            MATCHED_EXCLUDE=$(jq -n \
+              --argjson exclude "$EXCLUDE_LABELS_JSON" \
+              --argjson present "$PR_LABELS" \
+              '[$exclude[] | select(. as $e | $present | contains([$e]))] | join(", ")')
+            if [ -n "$MATCHED_EXCLUDE" ]; then
+              echo "::warning::Triggering PR #$PR_NUMBER has excluded label(s): $MATCHED_EXCLUDE — skipping"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          if [ "$(echo "$REQUIRED_LABELS_JSON" | jq 'length')" -gt 0 ]; then
+            MISSING=$(jq -n \
+              --argjson required "$REQUIRED_LABELS_JSON" \
+              --argjson present "$PR_LABELS" \
+              '[$required[] | select(. as $r | $present | contains([$r]) | not)] | join(", ")')
+            if [ -n "$MISSING" ]; then
+              echo "::warning::Triggering PR #$PR_NUMBER is missing required label(s): $MISSING — skipping"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          : > "$GH_ERR_FILE"
+          CHANGED_FILES=$(gh pr view $PR_NUMBER --json files --jq '.files[].path' 2>"$GH_ERR_FILE")
+          CHANGED_FILES_STATUS=$?
+          if [ $CHANGED_FILES_STATUS -ne 0 ]; then
+            skip_with_gh_warning "Could not read changed files for PR #$PR_NUMBER"
+          fi
+          if [ -n "$CHANGED_FILES" ]; then
+            printf '%s\n' "$CHANGED_FILES" > /tmp/changed_files.txt
+          else
+            : > /tmp/changed_files.txt
+          fi
+          MATCH=false
+          while IFS= read -r folder; do
+            folder="${folder#./}"
+            if grep -q "^${folder}/" /tmp/changed_files.txt; then
+              MATCH=true
+              break
+            fi
+          done < /tmp/app_folders.txt
+          if [ "$MATCH" == "false" ]; then
+            echo "::warning::No changes detected in any appFolders — skipping sync"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Register AL permission set merge driver
+        if: steps.trigger.outputs.skip == 'false' && steps.algocheck.outputs.skip == 'false' && steps.prcheck.outputs.skip == 'false'
+        run: |
+          bash .github/scripts/setup-merge-driver.sh
+
+      - name: Reset, merge and trigger CI/CD for each test branch
+        id: merge
+        if: steps.trigger.outputs.skip == 'false' && steps.algocheck.outputs.skip == 'false' && steps.prcheck.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_BRANCHES_JSON: ${{ steps.settings.outputs.testBranchesJson }}
+        run: |
+          set +e
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          touch /tmp/all_branch_summaries.txt
+          # Write branches config to file to avoid shell injection via single-quoted interpolation
+          echo "$TEST_BRANCHES_JSON" > /tmp/test_branches.json
+          while IFS= read -r branch_json; do
+            TEST_BRANCH=$(echo "$branch_json" | jq -r '.name')
+            BASE_BRANCH=$(echo "$branch_json" | jq -r '.baseBranch')
+            REQUIRED_LABELS_JSON=$(echo "$branch_json" | jq -c '.requiredLabels // []')
+            EXCLUDE_LABELS_JSON=$(echo "$branch_json"  | jq -c '.excludeLabels // []')
+            HAS_REQUIRED=$(echo "$REQUIRED_LABELS_JSON" | jq 'length > 0')
+            HAS_EXCLUDE=$(echo "$EXCLUDE_LABELS_JSON" | jq 'length > 0')
+
+            echo "::group::Processing test branch: $TEST_BRANCH (base: $BASE_BRANCH)"
+
+            # Reset branch
+            git checkout "$BASE_BRANCH"
+            git pull origin "$BASE_BRANCH"
+            git branch --list "$TEST_BRANCH" | grep -q . && git branch -D "$TEST_BRANCH" || true
+            git checkout -b "$TEST_BRANCH"
+            git push origin "$TEST_BRANCH" --force || true
+
+            # Per-branch temp files (sanitize branch name for use in file paths)
+            SAFE_BRANCH=$(echo "$TEST_BRANCH" | tr '/' '_')
+            MERGED_FILE="/tmp/merged_${SAFE_BRANCH}.txt"
+            SKIPPED_FILE="/tmp/skipped_${SAFE_BRANCH}.txt"
+            UNLABELLED_FILE="/tmp/unlabelled_${SAFE_BRANCH}.txt"
+            EXCLUDED_FILE="/tmp/excluded_${SAFE_BRANCH}.txt"
+            PR_METADATA_FILE="/tmp/pr_metadata_${SAFE_BRANCH}.txt"
+            touch "$MERGED_FILE" "$SKIPPED_FILE" "$UNLABELLED_FILE" "$EXCLUDED_FILE" "$PR_METADATA_FILE"
+            extract_linked_issue_metadata() {
+              local pr_body="$1"
+              local issue_num issue_text order_no_candidate
+              LINKED_ISSUES=$(echo "$pr_body" | grep -oiE '(closes|fixes|resolves)[[:space:]]+([[:alnum:]_.-]+/[[:alnum:]_.-]+)?#[0-9]+' | sed -E 's/.*#([0-9]+)$/\1/' | awk '!seen[$0]++' || true)
+              LINKED_ISSUE_CSV=$(printf '%s\n' "$LINKED_ISSUES" | sed '/^$/d' | paste -sd, -)
+              ORDER_NO=""
+              for issue_num in $LINKED_ISSUES; do
+                issue_text=$(gh api /repos/${{ github.repository }}/issues/$issue_num --jq '"\(.title // "")\n\(.body // "")"' 2>/dev/null || true)
+                order_no_candidate=$(echo "$issue_text" | grep -oiE 'Order No\.?[[:space:]]*:[[:space:]]*[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)
+                if [ -n "$order_no_candidate" ]; then
+                  ORDER_NO="$order_no_candidate"
+                  break
+                fi
+              done
+            }
+
+            gh pr list --state open --draft=false --json number,headRefName,title,url,labels,body \
+              --jq '[.[] | .] | sort_by(.number) | .[]' > /tmp/candidate_prs.json
+            jq -c '.' /tmp/candidate_prs.json | while IFS= read -r pr_json; do
+              pr_number=$(echo "$pr_json" | jq -r '.number')
+              branch=$(echo "$pr_json"   | jq -r '.headRefName')
+              title=$(echo "$pr_json"    | jq -r '.title')
+              url=$(echo "$pr_json"      | jq -r '.url')
+              pr_labels=$(echo "$pr_json" | jq -c '[.labels[].name]')
+              pr_body=$(echo "$pr_json" | jq -r '.body // ""')
+              extract_linked_issue_metadata "$pr_body"
+              linked_issues="$LINKED_ISSUES"
+              linked_issue_csv="$LINKED_ISSUE_CSV"
+              order_no="$ORDER_NO"
+              echo "$pr_number|$linked_issue_csv|$order_no" >> "$PR_METADATA_FILE"
+              for issue_num in $linked_issues; do
+                issue_json=$(gh api /repos/${{ github.repository }}/issues/$issue_num 2>/dev/null || true)
+                if echo "$issue_json" | jq -e . >/dev/null 2>&1; then
+                  issue_labels=$(echo "$issue_json" | jq '[.labels[].name]')
+                else
+                  issue_labels='[]'
+                fi
+                pr_labels=$(jq -n --argjson a "$pr_labels" --argjson b "$issue_labels" '$a + $b | unique')
+              done
+              if [ "$HAS_EXCLUDE" == "true" ]; then
+                MATCHED_EXCLUDE=$(jq -n \
+                  --argjson exclude "$EXCLUDE_LABELS_JSON" \
+                  --argjson present "$pr_labels" \
+                  '[$exclude[] | select(. as $e | $present | contains([$e]))] | join(", ")')
+                if [ -n "$MATCHED_EXCLUDE" ]; then
+                  echo "$pr_number|$title|$url|$MATCHED_EXCLUDE|$linked_issue_csv|$order_no" >> "$EXCLUDED_FILE"
+                  continue
+                fi
+              fi
+              if [ "$HAS_REQUIRED" == "true" ]; then
+                MISSING=$(jq -n \
+                  --argjson required "$REQUIRED_LABELS_JSON" \
+                  --argjson present "$pr_labels" \
+                  '[$required[] | select(. as $r | $present | contains([$r]) | not)] | join(", ")')
+                if [ -n "$MISSING" ]; then
+                  continue
+                fi
+              fi
+              if ! git fetch origin "$branch" 2>/dev/null; then
+                echo "::warning::Could not fetch branch '$branch' for PR #$pr_number — skipping"
+                echo "$pr_number|$title|$url|$linked_issue_csv|$order_no" >> "$SKIPPED_FILE"
+                continue
+              fi
+              if git merge "origin/$branch" --no-ff -m "Merging $branch into $TEST_BRANCH (PR $pr_number)"; then
+                echo "$pr_number|$title|$url|$linked_issue_csv|$order_no" >> "$MERGED_FILE"
+                CONFLICT_THEN_RESOLVED=$(gh pr view "$pr_number" --json comments | \
+                  jq -r --arg branch "$TEST_BRANCH" '
+                    (.comments | map(.body | contains("Merge conflict detected on the `\($branch)` branch")) | rindex(true)) as $last_conflict_idx |
+                    (.comments | map(.body | contains("Conflict resolved — successfully merged into `\($branch)`")) | rindex(true)) as $last_resolved_idx |
+                    if $last_conflict_idx == null then "no-conflict"
+                    elif $last_resolved_idx == null then "needs-resolution"
+                    elif $last_resolved_idx > $last_conflict_idx then "already-resolved"
+                    else "needs-resolution"
+                    end')
+                if [ "$CONFLICT_THEN_RESOLVED" == "needs-resolution" ]; then
+                  gh pr comment "$pr_number" --body "Conflict resolved — successfully merged into \`$TEST_BRANCH\`"
+                fi
+              else
+                echo "::warning::Conflict merging PR #$pr_number into $TEST_BRANCH — skipping"
+                git merge --abort 2>/dev/null || true
+                echo "$pr_number|$title|$url|$linked_issue_csv|$order_no" >> "$SKIPPED_FILE"
+                EXISTING_CONFLICT_COMMENT=$(gh pr view "$pr_number" --json comments | \
+                  jq -r --arg branch "$TEST_BRANCH" \
+                  '[.comments[] | select(.body | contains("Merge conflict detected on the `\($branch)` branch"))] | last | .id // empty')
+                if [ -z "$EXISTING_CONFLICT_COMMENT" ]; then
+                  gh pr comment "$pr_number" --body "Merge conflict detected on the \`$TEST_BRANCH\` branch. This PR could not be merged into the test branch — please resolve the conflict and push an updated branch."
+                fi
+              fi
+            done
+            if [ "$HAS_REQUIRED" == "true" ]; then
+              gh pr list --state open --draft=false --json number,title,url,labels,body > /tmp/all_open_prs_for_required_check.json
+              jq -c --argjson required "$REQUIRED_LABELS_JSON" \
+                '[.[] | select((.labels | map(.name)) as $pl | $required | all(. as $r | $pl | contains([$r])) | not)] | sort_by(.number) | .[]' \
+                /tmp/all_open_prs_for_required_check.json > /tmp/unlabelled_candidate_prs.json
+              jq -c '.' /tmp/unlabelled_candidate_prs.json | while IFS= read -r pr_json; do
+                pr_number=$(echo "$pr_json" | jq -r '.number')
+                title=$(echo "$pr_json" | jq -r '.title')
+                url=$(echo "$pr_json" | jq -r '.url')
+                pr_body=$(echo "$pr_json" | jq -r '.body // ""')
+                metadata_line=$(grep -m1 "^${pr_number}\\|" "$PR_METADATA_FILE" || true)
+                if [ -n "$metadata_line" ]; then
+                  IFS='|' read -r _ linked_issue_csv order_no <<< "$metadata_line"
+                else
+                  extract_linked_issue_metadata "$pr_body"
+                  linked_issue_csv="$LINKED_ISSUE_CSV"
+                  order_no="$ORDER_NO"
+                fi
+                echo "$pr_number|$title|$url|$linked_issue_csv|$order_no" >> "$UNLABELLED_FILE"
+              done
+            fi
+
+            git push origin "$TEST_BRANCH" || true
+
+            # Collect merged branch names for the trigger-cicd job
+            MERGED_BRANCHES_LIST="${MERGED_BRANCHES_LIST:+$MERGED_BRANCHES_LIST,}$TEST_BRANCH"
+
+            # Record branch summary marker for post-summary step
+            REQUIRED_DISPLAY=$(echo "$REQUIRED_LABELS_JSON" | jq -r '. | join(", ")')
+            EXCLUDE_DISPLAY=$(echo "$EXCLUDE_LABELS_JSON" | jq -r '. | join(", ")')
+            echo "BRANCH_START|$TEST_BRANCH|$BASE_BRANCH|$REQUIRED_DISPLAY|$EXCLUDE_DISPLAY" >> /tmp/all_branch_summaries.txt
+            cat "$MERGED_FILE"    | sed 's/^/MERGED|/' >> /tmp/all_branch_summaries.txt
+            cat "$SKIPPED_FILE"   | sed 's/^/SKIPPED|/' >> /tmp/all_branch_summaries.txt
+            cat "$EXCLUDED_FILE"  | sed 's/^/EXCLUDED|/' >> /tmp/all_branch_summaries.txt
+            cat "$UNLABELLED_FILE"| sed 's/^/UNLABELLED|/' >> /tmp/all_branch_summaries.txt
+
+            echo "::endgroup::"
+          done < <(jq -c '.[]' /tmp/test_branches.json)
+          echo "mergedBranches=${MERGED_BRANCHES_LIST}" >> $GITHUB_OUTPUT
+
+      - name: Post job summary
+        id: job_summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REQUIRED_LABELS_DISPLAY="${{ steps.settings.outputs.requiredLabelsDisplay }}"
+          EXCLUDE_LABELS_DISPLAY="${{ steps.settings.outputs.excludeLabelsDisplay }}"
+          SKIP_SETTINGS="${{ steps.settings.outputs.skip }}"
+          SKIP_ALGO="${{ steps.algocheck.outputs.skip }}"
+          SKIP_PR="${{ steps.prcheck.outputs.skip }}"
+          TRIGGER="${{ github.event_name }}"
+          if [ "${{ github.event_name }}" == "workflow_run" ]; then
+            TRIGGERING_RUN="[${{ github.event.workflow_run.name }} #${{ github.event.workflow_run.run_number }}](${{ github.event.workflow_run.html_url }})"
+            TRIGGERING_PR_NUMBER=$(gh api \
+              /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }} \
+              --jq '.pull_requests[0].number // empty')
+            if [ -n "$TRIGGERING_PR_NUMBER" ]; then
+              TRIGGERING_PR_URL="https://github.com/${{ github.repository }}/pull/$TRIGGERING_PR_NUMBER"
+              TRIGGERING_PR="[#$TRIGGERING_PR_NUMBER]($TRIGGERING_PR_URL)"
+            else
+              TRIGGERING_PR="_not associated with a PR_"
+            fi
+          else
+            TRIGGERING_RUN="_manual dispatch_"
+            TRIGGERING_PR="_n/a_"
+          fi
+          {
+            echo "# 🔀 Sync PRs to Test Branch"
+            echo ""
+            echo "**Trigger:** \`$TRIGGER\`  "
+            echo "**Triggering run:** $TRIGGERING_RUN  "
+            echo "**Triggering PR:** $TRIGGERING_PR  "
+            echo ""
+            if [ "$SKIP_SETTINGS" == "true" ]; then
+              echo "## ⚠️ Skipped"; echo "Settings check failed."
+            elif [ "$SKIP_ALGO" == "true" ]; then
+              echo "## ⚠️ Skipped"; echo "No \`appFolders\` found."
+            elif [ "$SKIP_PR" == "true" ]; then
+              echo "## ⚠️ Skipped"; echo "Triggering PR did not meet eligibility criteria."
+            else
+              # Parse per-branch summaries written by the merge step
+              if [ -f /tmp/all_branch_summaries.txt ]; then
+                CURRENT_BRANCH=""
+                BRANCH_ORDER=()
+                declare -A BRANCH_BASE BRANCH_MERGED BRANCH_SKIPPED BRANCH_EXCLUDED BRANCH_UNLABELLED
+                render_linked_issues() {
+                  local linked_csv="$1"
+                  if [ -z "$linked_csv" ]; then
+                    echo "_none_"
+                    return
+                  fi
+                  local output=""
+                  local issue_num
+                  IFS=',' read -r -a issue_nums <<< "$linked_csv"
+                  for issue_num in "${issue_nums[@]}"; do
+                    [ -n "$issue_num" ] || continue
+                    output="${output:+$output, }[#$issue_num](https://github.com/${{ github.repository }}/issues/$issue_num)"
+                  done
+                  [ -n "$output" ] && echo "$output" || echo "_none_"
+                }
+                while IFS='|' read -r tag f1 f2 f3 f4 f5 f6; do
+                  case "$tag" in
+                    BRANCH_START)
+                      CURRENT_BRANCH="$f1"
+                      BRANCH_ORDER+=("$f1")
+                      BRANCH_BASE["$f1"]="$f2"
+                      BRANCH_MERGED["$f1"]=""
+                      BRANCH_SKIPPED["$f1"]=""
+                      BRANCH_EXCLUDED["$f1"]=""
+                      BRANCH_UNLABELLED["$f1"]=""
+                      ;;
+                    MERGED)    BRANCH_MERGED["$CURRENT_BRANCH"]+="${f1}|${f2}|${f3}|${f4}|${f5}"$'\n' ;;
+                    SKIPPED)   BRANCH_SKIPPED["$CURRENT_BRANCH"]+="${f1}|${f2}|${f3}|${f4}|${f5}"$'\n' ;;
+                    EXCLUDED)  BRANCH_EXCLUDED["$CURRENT_BRANCH"]+="${f1}|${f2}|${f3}|${f4}|${f5}|${f6}"$'\n' ;;
+                    UNLABELLED)BRANCH_UNLABELLED["$CURRENT_BRANCH"]+="${f1}|${f2}|${f3}|${f4}|${f5}"$'\n' ;;
+                  esac
+                done < /tmp/all_branch_summaries.txt
+                for branch_key in "${BRANCH_ORDER[@]}"; do
+                  echo "---"
+                  echo "## 🌿 Test branch: \`$branch_key\`"
+                  echo "**Base branch:** \`${BRANCH_BASE[$branch_key]:-N/A}\`  "
+                  echo ""
+                  echo "### ✅ Merged PRs"
+                  if [ -n "${BRANCH_MERGED[$branch_key]}" ]; then
+                    echo "| PR | Title | Linked Issue | Order No |"; echo "|----|-------|--------------|----------|"
+                    while IFS='|' read -r n t u li on; do
+                      [ -n "$n" ] || continue
+                      linked_display=$(render_linked_issues "$li")
+                      order_display="${on:-_none_}"
+                      [ -n "$order_display" ] || order_display="_none_"
+                      echo "| [#$n]($u) | $t | $linked_display | $order_display |"
+                    done <<< "${BRANCH_MERGED[$branch_key]}"
+                  else
+                    echo "_No PRs merged._"
+                  fi
+                  echo ""; echo "### ⚠️ Skipped PRs (merge conflict)"
+                  if [ -n "${BRANCH_SKIPPED[$branch_key]}" ]; then
+                    echo "| PR | Title | Linked Issue | Order No |"; echo "|----|-------|--------------|----------|"
+                    while IFS='|' read -r n t u li on; do
+                      [ -n "$n" ] || continue
+                      linked_display=$(render_linked_issues "$li")
+                      order_display="${on:-_none_}"
+                      [ -n "$order_display" ] || order_display="_none_"
+                      echo "| [#$n]($u) | $t | $linked_display | $order_display |"
+                    done <<< "${BRANCH_SKIPPED[$branch_key]}"
+                  else
+                    echo "_No PRs skipped._"
+                  fi
+                  if [ -n "${BRANCH_EXCLUDED[$branch_key]}" ]; then
+                    echo ""; echo "### 🚫 Excluded PRs (excluded label)"
+                    echo "| PR | Title | Matched Label(s) | Linked Issue | Order No |"; echo "|----|-------|------------------|--------------|----------|"
+                    while IFS='|' read -r n t u m li on; do
+                      [ -n "$n" ] || continue
+                      linked_display=$(render_linked_issues "$li")
+                      order_display="${on:-_none_}"
+                      [ -n "$order_display" ] || order_display="_none_"
+                      echo "| [#$n]($u) | $t | \`$m\` | $linked_display | $order_display |"
+                    done <<< "${BRANCH_EXCLUDED[$branch_key]}"
+                  fi
+                  if [ -n "${BRANCH_UNLABELLED[$branch_key]}" ]; then
+                    echo ""; echo "### 🏷️ Excluded PRs (missing required label(s))"
+                    echo "| PR | Title | Linked Issue | Order No |"; echo "|----|-------|--------------|----------|"
+                    while IFS='|' read -r n t u li on; do
+                      [ -n "$n" ] || continue
+                      linked_display=$(render_linked_issues "$li")
+                      order_display="${on:-_none_}"
+                      [ -n "$order_display" ] || order_display="_none_"
+                      echo "| [#$n]($u) | $t | $linked_display | $order_display |"
+                    done <<< "${BRANCH_UNLABELLED[$branch_key]}"
+                  fi
+                done
+              else
+                echo "_No branch summary data available._"
+              fi
+            fi
+          } | tee /tmp/rebuild_test_branch_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write sync result artifact for Power BI Sync
+        if: always()
+        run: |
+          mkdir -p /tmp/sync-artifact
+          MERGED_BRANCHES_JSON=$(printf '%s' "${{ steps.merge.outputs.mergedBranches }}" | \
+            jq -R -c 'split(",") | map(select(length > 0))')
+          [ -f /tmp/rebuild_test_branch_summary.md ] || : > /tmp/rebuild_test_branch_summary.md
+          jq -n \
+            --arg repository "${{ github.repository }}" \
+            --arg repoName "$(basename "${{ github.repository }}")" \
+            --argjson mergedBranches "${MERGED_BRANCHES_JSON:-[]}" \
+            --arg jobStatus "${{ job.status }}" \
+            --rawfile summaryMarkdown /tmp/rebuild_test_branch_summary.md \
+            '{
+              repository: $repository,
+              repoName: $repoName,
+              mergedBranches: $mergedBranches,
+              jobStatus: $jobStatus,
+              summaryMarkdown: $summaryMarkdown
+            }' > /tmp/sync-artifact/sync-result.json
+          cat /tmp/sync-artifact/sync-result.json
+
+      - name: Upload sync result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-result
+          path: /tmp/sync-artifact/sync-result.json
+          retention-days: 7
+
+      - name: Post commit status to triggering PR
+        if: always() && github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          if [ -z "$SHA" ]; then
+            echo "::notice::No head SHA available — skipping commit status post"
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" == "success" ]; then
+            STATE="success"
+            DESCRIPTION="Sync completed successfully"
+          elif [ "${{ job.status }}" == "failure" ]; then
+            STATE="failure"
+            DESCRIPTION="Sync failed — check the workflow run for details"
+          elif [ "${{ job.status }}" == "cancelled" ]; then
+            STATE="failure"
+            DESCRIPTION="Sync was cancelled — check the workflow run for details"
+          else
+            STATE="failure"
+            DESCRIPTION="Sync finished with an unexpected status — check the workflow run for details"
+          fi
+
+          gh api \
+            --method POST \
+            /repos/${{ github.repository }}/statuses/$SHA \
+            -f state="$STATE" \
+            -f description="$DESCRIPTION" \
+            -f context="rebuild-test-branch" \
+            -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  trigger-cicd:
+    name: Trigger CI/CD for test branches
+    needs: rebuild-test-branch
+    if: needs.rebuild-test-branch.outputs.mergedBranches != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      MERGED_BRANCHES: ${{ needs.rebuild-test-branch.outputs.mergedBranches }}
+    steps:
+      - name: Trigger CICD for each merged test branch
+        run: |
+          IFS=',' read -ra BRANCHES <<< "$MERGED_BRANCHES"
+          for TEST_BRANCH in "${BRANCHES[@]}"; do
+            if gh workflow run CICD.yaml --ref "$TEST_BRANCH" --repo "$REPOSITORY" 2>&1; then
+              echo "::notice::Triggered AL-Go CI/CD workflow on $TEST_BRANCH"
+            else
+              echo "::warning::Could not trigger CICD workflow on $TEST_BRANCH via workflow_dispatch — CI may already have been triggered by the push event"
+            fi
+          done

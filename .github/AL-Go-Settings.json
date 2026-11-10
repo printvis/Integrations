@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v10.0/.Modules/settings.schema.json",
+  "type": "PTE",
+  "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
+  "templateSha": "99aa680a2af06a94b60c9fc9881aa2885681facc",
+  "excludeEnvironments": [
+    "copilot"
+  ],
+  "customALGoFiles": {
+    "filesToInclude": [
+      {
+        "sourceFolder": ".github/scripts",
+        "filter": "*",
+        "destinationFolder": ".github/scripts"
+      },
+      {
+        "sourceFolder": ".github/scripts/GitHub",
+        "filter": "*",
+        "destinationFolder": ".github/scripts/GitHub"
+      },
+      {
+        "sourceFolder": ".github/scripts/PullRequestValidation",
+        "filter": "*",
+        "destinationFolder": ".github/scripts/PullRequestValidation"
+      },
+      {
+        "sourceFolder": ".github/scripts/tests",
+        "filter": "*",
+        "destinationFolder": ".github/scripts/tests"
+      }
+    ]
+  }
+}
