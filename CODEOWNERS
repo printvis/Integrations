@@ -3,3 +3,4 @@
 .Github/ @PrintVis/Repo-Admin 
 .github/scripts/GitHub/ @PrintVis/Repo-Admin
 .github/scripts/PullRequestValidation/ @PrintVis/Repo-Admin
+Apps/* @PrintVis/Dev
