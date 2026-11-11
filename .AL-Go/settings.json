@@ -1,9 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/AL-Go-Actions/v10.0/.Modules/settings.schema.json",
   "country": "w1",
-  "appFolders": ["Apps/SpencerMetrics/PrintVis SpencerMetrics"],
+  "appFolders": [
+    "Apps/SpencerMetrics/PrintVis SpencerMetrics"
+  ],
   "testFolders": [],
-  "bcptTestFolders": [], 
+  "bcptTestFolders": [],
   "enableCodeCop": true,
-  "enableUICop": true
+  "enableUICop": true,
+  "repoVersion": "28.0.0"
 }
