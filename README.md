@@ -1,3 +1,6 @@
+
+Repo moved / merged into https://github.com/printvis/OpenSource
+
 # AL-Go Per Tenant Extension Template
 
 This template repository can be used for managing Per-tenant Extensions (PTEs) for Business Central.
